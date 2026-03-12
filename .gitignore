@@ -1,0 +1,28 @@
+heart-stroke-frontend/node_modules/
+node_modules/
+heart-stroke-backend/heart_mri_resnet50 (1).h5
+heart-stroke-backend/heart_mri_resnet50.h5
+heart-stroke-backend\heart_mri_resnet50.keras
+
+# ML models
+*.h5
+*.keras
+
+# Next.js
+.next/
+node_modules/
+
+# Python
+__pycache__/
+*.pyc
+
+*.h5
+*.keras
+*.pt
+*.pth
+*.ckpt
+
+heart-stroke-backend/*.h5
+heart-stroke-backend/*.keras
+
+heart-stroke-frontend/.next/dev/
