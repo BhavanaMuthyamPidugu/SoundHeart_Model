@@ -1,13 +1,13 @@
-from fastapi import FastAPI, File, UploadFile, Form
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 
 import pickle
 import pandas as pd
+import numpy as np
 import shap
 import tensorflow as tf
 from PIL import Image
 import io
-import os
 
 app = FastAPI()
 
@@ -19,9 +19,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ----------------------------
-# LOAD CLINICAL MODEL
-# ----------------------------
+# --------------------------
+# LOAD STROKE MODEL
+# --------------------------
 
 print("Loading stroke model...")
 
@@ -30,46 +30,35 @@ scaler = pickle.load(open("scaler.pkl", "rb"))
 
 explainer = shap.TreeExplainer(model)
 
-print("Stroke model loaded.")
+print("Stroke model loaded")
 
-# ----------------------------
-# LOAD MRI MODEL SAFELY
-# ----------------------------
+# --------------------------
+# LOAD MRI MODEL
+# --------------------------
 
-cnn_model = None
+print("Loading MRI model...")
 
-if os.path.exists("heart_mri_resnet50.h5"):
-    try:
-        cnn_model = tf.keras.models.load_model(
-            "heart_mri_resnet50.h5",
-            compile=False
-        )
-        print("MRI model loaded successfully.")
-    except Exception as e:
-        print("MRI MODEL FAILED TO LOAD")
-        print(e)
+cnn_model = tf.keras.models.load_model("heart_mri_resnet50 (1).keras")
 
-# ----------------------------
-# MRI PREPROCESS
-# ----------------------------
+print("MRI model loaded")
+
+# --------------------------
+# MRI PREPROCESSING
+# --------------------------
 
 def preprocess_mri(image_bytes):
 
-    image = Image.open(io.BytesIO(image_bytes)).convert("L")
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     image = image.resize((224,224))
 
-    image = tf.keras.preprocessing.image.img_to_array(image)
-    image = tf.image.grayscale_to_rgb(image)
-
-    image = image / 255.0
-    image = tf.expand_dims(image, axis=0)
+    image = np.array(image)/255.0
+    image = np.expand_dims(image,axis=0)
 
     return image
 
-
-# ----------------------------
-# HYBRID PREDICTION
-# ----------------------------
+# --------------------------
+# HYBRID PREDICTION API
+# --------------------------
 
 @app.post("/predict_hybrid")
 
@@ -94,10 +83,6 @@ async def predict_hybrid(
     dizziness: int = Form(...)
 ):
 
-    # ----------------------------
-    # CLINICAL DATA
-    # ----------------------------
-
     data = {
         "age": age,
         "gender": gender.lower(),
@@ -118,7 +103,6 @@ async def predict_hybrid(
 
     df = pd.DataFrame([data])
 
-    # Encoding
     df["gender"] = df["gender"].map({"male":1,"female":0})
 
     df["smoking_status"] = df["smoking_status"].map({
@@ -129,72 +113,298 @@ async def predict_hybrid(
 
     scaled = scaler.transform(df)
 
-    # ----------------------------
-    # STROKE MODEL
-    # ----------------------------
+    # stroke_prob = model.predict_proba(scaled)[0][1]
+    stroke_prob = float(model.predict_proba(scaled)[0][1])
 
-    stroke_probability = model.predict_proba(scaled)[0][1]
+    # SHAP Explainability
+    # shap_values = explainer.shap_values(scaled)
 
-    # ----------------------------
-    # SHAP EXPLAINABILITY
-    # ----------------------------
+    # feature_imp = dict(zip(df.columns, shap_values[0]))
 
+    # top_features = sorted(
+    #     feature_imp.items(),
+    #     key=lambda x: abs(x[1]),
+    #     reverse=True
+    # )[:5]
+
+
+    # SHAP Explainability
     shap_values = explainer.shap_values(scaled)
 
-    feature_importance = dict(
-        zip(df.columns.tolist(), shap_values[0].tolist())
-    )
+    shap_array = shap_values[0]
+
+    feature_imp = {}
+
+    for i, col in enumerate(df.columns):
+        feature_imp[col] = float(shap_array[i])
 
     top_features = sorted(
-        feature_importance.items(),
+        feature_imp.items(),
         key=lambda x: abs(x[1]),
         reverse=True
     )[:5]
 
-    # ----------------------------
-    # MRI MODEL
-    # ----------------------------
 
-    mri_prediction = 0
-    mri_result = "MRI Model Not Loaded"
+    # MRI prediction
+    contents = await file.read()
 
-    if cnn_model is not None:
+    img = preprocess_mri(contents)
 
-        contents = await file.read()
-        image = preprocess_mri(contents)
+    # mri_prob = cnn_model.predict(img)[0][0]
+    mri_prob = float(cnn_model.predict(img)[0][0])
 
-        mri_prediction = cnn_model.predict(image)[0][0]
+    mri_result = "Disease Detected" if mri_prob > 0.5 else "Normal"
 
-        if mri_prediction > 0.5:
-            mri_result = "Disease Detected"
-        else:
-            mri_result = "Normal"
-
-    # ----------------------------
-    # HYBRID RISK
-    # ----------------------------
-
-    if stroke_probability > 0.7 and mri_prediction > 0.7:
-        final_risk = "Severe High Risk"
-
-    elif stroke_probability > 0.7 or mri_prediction > 0.7:
-        final_risk = "High Risk"
-
-    elif stroke_probability > 0.4 or mri_prediction > 0.5:
-        final_risk = "Medium Risk"
-
+    # Hybrid Risk
+    if stroke_prob > 0.7 and mri_prob > 0.7:
+        risk = "Severe High Risk"
+    elif stroke_prob > 0.7 or mri_prob > 0.7:
+        risk = "High Risk"
+    elif stroke_prob > 0.4 or mri_prob > 0.5:
+        risk = "Medium Risk"
     else:
-        final_risk = "Low Risk"
+        risk = "Low Risk"
 
+    # return {
+
+    #     "stroke_probability": float(stroke_prob),
+
+    #     "mri_probability": float(mri_prob),
+
+    #     "mri_result": mri_result,
+
+    #     "final_risk": risk,
+
+    #     "top_risk_factors": top_features
+
+    # }
     return {
 
-        "stroke_probability": float(stroke_probability),
-        "mri_probability": float(mri_prediction),
-        "mri_result": mri_result,
-        "final_risk": final_risk,
-        "top_risk_factors": top_features
+        "stroke_probability": float(stroke_prob),
+
+        "mri_probability": float(mri_prob),
+
+        "mri_result": str(mri_result),
+
+        "final_risk": str(risk),
+
+        "top_risk_factors": [
+            {
+                "feature": str(f[0]),
+                "impact": float(f[1])
+            }
+            for f in top_features
+        ]
 
     }
+
+
+
+
+
+
+
+
+
+
+
+# from fastapi import FastAPI, File, UploadFile, Form
+# from fastapi.middleware.cors import CORSMiddleware
+
+# import pickle
+# import pandas as pd
+# import shap
+# import tensorflow as tf
+# from PIL import Image
+# import io
+# import os
+
+# app = FastAPI()
+
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=["*"],
+#     allow_credentials=True,
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+# )
+
+# # ----------------------------
+# # LOAD CLINICAL MODEL
+# # ----------------------------
+
+# print("Loading stroke model...")
+
+# model = pickle.load(open("stroke_model.pkl", "rb"))
+# scaler = pickle.load(open("scaler.pkl", "rb"))
+
+# explainer = shap.TreeExplainer(model)
+
+# print("Stroke model loaded.")
+
+# # ----------------------------
+# # LOAD MRI MODEL SAFELY
+# # ----------------------------
+
+# cnn_model = None
+
+# if os.path.exists("heart_mri_resnet50.h5"):
+#     try:
+#         cnn_model = tf.keras.models.load_model(
+#             "heart_mri_resnet50.h5",
+#             compile=False
+#         )
+#         print("MRI model loaded successfully.")
+#     except Exception as e:
+#         print("MRI MODEL FAILED TO LOAD")
+#         print(e)
+
+# # ----------------------------
+# # MRI PREPROCESS
+# # ----------------------------
+
+# def preprocess_mri(image_bytes):
+
+#     image = Image.open(io.BytesIO(image_bytes)).convert("L")
+#     image = image.resize((224,224))
+
+#     image = tf.keras.preprocessing.image.img_to_array(image)
+#     image = tf.image.grayscale_to_rgb(image)
+
+#     image = image / 255.0
+#     image = tf.expand_dims(image, axis=0)
+
+#     return image
+
+
+# # ----------------------------
+# # HYBRID PREDICTION
+# # ----------------------------
+
+# @app.post("/predict_hybrid")
+
+# async def predict_hybrid(
+
+#     file: UploadFile = File(...),
+
+#     age: float = Form(...),
+#     gender: str = Form(...),
+#     hypertension: int = Form(...),
+#     heart_disease: int = Form(...),
+#     avg_glucose_level: float = Form(...),
+#     bmi: float = Form(...),
+#     smoking_status: str = Form(...),
+#     physical_activity_hours: float = Form(...),
+#     covid_infected: int = Form(...),
+#     vaccination_doses: float = Form(...),
+#     post_covid_fatigue: int = Form(...),
+#     inflammation_marker: int = Form(...),
+#     brain_fog: int = Form(...),
+#     memory_loss: int = Form(...),
+#     dizziness: int = Form(...)
+# ):
+
+#     # ----------------------------
+#     # CLINICAL DATA
+#     # ----------------------------
+
+#     data = {
+#         "age": age,
+#         "gender": gender.lower(),
+#         "hypertension": hypertension,
+#         "heart_disease": heart_disease,
+#         "avg_glucose_level": avg_glucose_level,
+#         "bmi": bmi,
+#         "smoking_status": smoking_status.lower(),
+#         "physical_activity_hours": physical_activity_hours,
+#         "covid_infected": covid_infected,
+#         "vaccination_doses": vaccination_doses,
+#         "post_covid_fatigue": post_covid_fatigue,
+#         "inflammation_marker": inflammation_marker,
+#         "brain_fog": brain_fog,
+#         "memory_loss": memory_loss,
+#         "dizziness": dizziness
+#     }
+
+#     df = pd.DataFrame([data])
+
+#     # Encoding
+#     df["gender"] = df["gender"].map({"male":1,"female":0})
+
+#     df["smoking_status"] = df["smoking_status"].map({
+#         "never smoked":0,
+#         "formerly smoked":1,
+#         "smokes":2
+#     })
+
+#     scaled = scaler.transform(df)
+
+#     # ----------------------------
+#     # STROKE MODEL
+#     # ----------------------------
+
+#     stroke_probability = model.predict_proba(scaled)[0][1]
+
+#     # ----------------------------
+#     # SHAP EXPLAINABILITY
+#     # ----------------------------
+
+#     shap_values = explainer.shap_values(scaled)
+
+#     feature_importance = dict(
+#         zip(df.columns.tolist(), shap_values[0].tolist())
+#     )
+
+#     top_features = sorted(
+#         feature_importance.items(),
+#         key=lambda x: abs(x[1]),
+#         reverse=True
+#     )[:5]
+
+#     # ----------------------------
+#     # MRI MODEL
+#     # ----------------------------
+
+#     mri_prediction = 0
+#     mri_result = "MRI Model Not Loaded"
+
+#     if cnn_model is not None:
+
+#         contents = await file.read()
+#         image = preprocess_mri(contents)
+
+#         mri_prediction = cnn_model.predict(image)[0][0]
+
+#         if mri_prediction > 0.5:
+#             mri_result = "Disease Detected"
+#         else:
+#             mri_result = "Normal"
+
+#     # ----------------------------
+#     # HYBRID RISK
+#     # ----------------------------
+
+#     if stroke_probability > 0.7 and mri_prediction > 0.7:
+#         final_risk = "Severe High Risk"
+
+#     elif stroke_probability > 0.7 or mri_prediction > 0.7:
+#         final_risk = "High Risk"
+
+#     elif stroke_probability > 0.4 or mri_prediction > 0.5:
+#         final_risk = "Medium Risk"
+
+#     else:
+#         final_risk = "Low Risk"
+
+#     return {
+
+#         "stroke_probability": float(stroke_probability),
+#         "mri_probability": float(mri_prediction),
+#         "mri_result": mri_result,
+#         "final_risk": final_risk,
+#         "top_risk_factors": top_features
+
+#     }
 
 
 
